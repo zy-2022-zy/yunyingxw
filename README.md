@@ -13,30 +13,44 @@
 ## 环境要求
 
 - Windows 10/11
-- Python 3.11 或更高版本
-- Chrome/Chromium 所需运行依赖
+- Conda
+- Python 3.11
 - 业务人员已按公司要求安装并手动连接对应 VPN
 
 ## 安装
 
+在项目根目录打开 PowerShell：
+
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+conda create -n yunyingxw python=3.11 -y
+conda activate yunyingxw
 python -m pip install -r requirements.txt
 python -m playwright install chromium
 Copy-Item .env.example .env
 ```
 
-## 启动
+如果已经创建过 `yunyingxw` 环境，后续只需要执行：
 
 ```powershell
-python -m app.main
+conda activate yunyingxw
 ```
+
+## 启动
+
+确保已激活 `yunyingxw` 环境，并处于项目根目录：
+
+```powershell
+python run.py
+```
+
+Windows 下通过 `run.py` 设置 Playwright 所需的 Proactor 事件循环，并以单进程模式启动服务。
 
 启动后访问：
 
 - 健康检查：http://127.0.0.1:8000/api/health
 - API 文档：http://127.0.0.1:8000/docs
+
+停止服务：在运行服务的终端按 `Ctrl+C`。
 
 ## 检查运营商网站
 
@@ -54,4 +68,4 @@ python -m app.main
 
 ## 当前版本
 
-v0.1.0：项目骨架、本机 Playwright 浏览器管理、网站可访问性检测 API。
+v0.1.1：增加 Windows 兼容启动入口 `run.py`，并更新 Conda 安装和启动说明。
