@@ -10,6 +10,8 @@ from app.schemas import (
     BrowserOpenResponse,
     SiteCheckRequest,
     SiteCheckResponse,
+    LoginRequest,
+    LoginResponse,
 )
 
 
@@ -60,6 +62,68 @@ async def open_browser_page(payload: BrowserOpenRequest):
             raise HTTPException(
                 status_code=502,
                 detail=f"浏览器已启动或正在恢复，但打开网页失败：{str(exc)[:500]}",
+            ) from exc
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/login", response_model=LoginResponse)
+async def login(payload: LoginRequest):
+    """使用本次请求提供的账号密码登录；凭据不写入文件、配置或日志。"""
+    async with browser_manager.operation_lock:
+        try:
+            page = await browser_manager.get_page(settings.browser_timeout_ms)
+            if "login" not in page.url.lower():
+                await page.goto(
+                    "http://10.253.61.35/cmopchannel/login",
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+            account_input = page.locator("#loginNumber")
+            password_input = page.locator("#password")
+            await account_input.wait_for(state="visible")
+            await password_input.wait_for(state="visible")
+            await account_input.fill(payload.username)
+            await password_input.fill(payload.password.get_secret_value())
+            await page.locator('button[type="submit"]').click()
+
+            try:
+                await page.wait_for_url(
+                    lambda url: "login" not in str(url).lower(),
+                    timeout=15_000,
+                )
+            except PlaywrightError:
+                pass
+
+            final_url = page.url
+            title = await page.title()
+            if "login" not in final_url.lower():
+                return LoginResponse(
+                    status="login_success",
+                    message="登录后页面已跳转，初步判断登录成功。",
+                    final_url=final_url,
+                    page_title=title,
+                )
+
+            body_text = (await page.locator("body").inner_text())[:2000]
+            if any(word in body_text for word in ("验证码", "短信", "验证", "安全校验")):
+                return LoginResponse(
+                    status="verification_required",
+                    message="页面仍停留在登录页，可能需要完成验证码或其他人工验证。",
+                    final_url=final_url,
+                    page_title=title,
+                )
+            return LoginResponse(
+                status="login_failed",
+                message="登录后仍停留在登录页，请检查账号密码或页面提示。",
+                final_url=final_url,
+                page_title=title,
+            )
+        except PlaywrightError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"自动化登录操作失败：{str(exc)[:300]}",
             ) from exc
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
