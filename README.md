@@ -68,11 +68,6 @@ $form = @{
   url = "http://10.253.61.35/cmopchannel/login"
   username = "测试账号"
   password = "测试密码"
-  username = "测试账号"
-  password = "测试密码"
-  si_code = "201230033"
-  product_name = "易速达10694915"
-  business_name = "易速达10694915"
   excel_file = Get-Item ".\测试批量导入.xlsx"
   attachment_file = Get-Item ".\测试业务附件.pdf"
 }
