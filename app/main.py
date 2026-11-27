@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import tempfile
@@ -153,6 +154,23 @@ async def receive_batch_import_task(
         attachment_path = task_dir / ("业务附件" + attachment_suffix)
         excel_size = await save_upload(excel_file, excel_path)
         attachment_size = await save_upload(attachment_file, attachment_path)
+
+        # 保存不含账号密码的任务元数据，供后续网页上传阶段按 task_id 读取。
+        task_metadata = {
+            "task_id": task_id,
+            "si_code": si_code,
+            "product_name": product_name,
+            "business_name": business_name,
+            "excel_filename": excel_file.filename,
+            "attachment_filename": attachment_file.filename,
+            "excel_size_bytes": excel_size,
+            "attachment_size_bytes": attachment_size,
+            "status": "files_received",
+        }
+        (task_dir / "task.json").write_text(
+            json.dumps(task_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         # 一个业务任务独占浏览器操作锁，避免不同任务交叉操作同一 Chrome 页面。
         async with browser_manager.operation_lock:
