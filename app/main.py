@@ -114,8 +114,21 @@ async def find_product_order_frame(page):
 
 
 async def find_batch_result_frame(page):
-    """按批量处理结果查询页的表头识别 Frame，避免命中同 URL 的其他业务页。"""
+    """只定位当前激活的“批量处理结果查询”标签页中的结果列表 Frame。"""
     required_headers = ("待处理文件原文件名", "状态", "状态时间", "结果文件标识")
+
+    # 主页面标签栏是当前业务视图的权威状态，不能仅凭 Frame URL 或残留内容判断。
+    active_tab = page.locator(".ant-tabs-tab-active")
+    try:
+        active_count = await active_tab.count()
+        if active_count and not any(
+            "批量处理结果查询" in (await active_tab.nth(i).inner_text()).strip()
+            for i in range(active_count)
+        ):
+            return None
+    except PlaywrightError:
+        return None
+
     for frame in page.frames:
         if "/adcesop" not in frame.url:
             continue
@@ -123,6 +136,24 @@ async def find_batch_result_frame(page):
             iframe_element = await frame.frame_element()
             if not await iframe_element.is_visible():
                 continue
+
+            # 排除被 Ant Design 隐藏的历史标签页内容，即使其 iframe 仍保留旧 DOM。
+            tab_state = await iframe_element.evaluate(
+                """el => {
+                    let node = el;
+                    while (node && node !== document.body) {
+                        if (node.classList && [...node.classList].some(c => c.includes('tabpane'))) {
+                            return node.classList.contains('ant-tabs-tabpane-active') &&
+                                !node.classList.contains('ant-tabs-tabpane-hidden');
+                        }
+                        node = node.parentElement;
+                    }
+                    return true;
+                }"""
+            )
+            if not tab_state:
+                continue
+
             body_text = await frame.locator("body").inner_text(timeout=2_000)
             if not all(header in body_text for header in required_headers):
                 continue
@@ -584,17 +615,48 @@ async def get_page_table(
                         status_code=404,
                         detail=f"当前列表无法继续翻页，未能到达第 {page} 页；已停留在第 {current_page} 页。",
                     )
+                # 先记录当前页数据指纹。Ant Design 页码高亮可能先于接口数据更新，
+                # 因此不能只等待 active page 变化，否则会把上一页数据误认为目标页。
+                previous_fingerprint = await frame.evaluate(
+                    """() => {
+                        const table = document.querySelector('.ant-table-wrapper');
+                        if (!table) return '';
+                        return [...table.querySelectorAll('tbody tr')]
+                            .filter(row => row.getBoundingClientRect().width > 0)
+                            .map(row => (row.innerText || '').replace(/\\s+/g, ' ').trim())
+                            .join('\\n');
+                    }"""
+                )
                 await wait_between_actions()
                 await pager_button.click()
                 expected_page = current_page + (1 if direction == "next" else -1)
                 try:
                     await frame.wait_for_function(
-                        "(expected) => { const active = document.querySelector('.ant-pagination-item-active'); return active && active.textContent.trim() === String(expected); }",
-                        arg=expected_page,
+                        """({expected, previous}) => {
+                            const active = document.querySelector('.ant-pagination-item-active');
+                            const table = document.querySelector('.ant-table-wrapper');
+                            if (!active || active.textContent.trim() !== String(expected) || !table) return false;
+                            // 等待本次表格请求完成，不能在 loading 状态时读取。
+                            if (table.querySelector('.ant-spin-spinning')) return false;
+                            const fingerprint = [...table.querySelectorAll('tbody tr')]
+                                .filter(row => row.getBoundingClientRect().width > 0)
+                                .map(row => (row.innerText || '').replace(/\\s+/g, ' ').trim())
+                                .join('\\n');
+                            return fingerprint !== previous;
+                        }""",
+                        arg={"expected": expected_page, "previous": previous_fingerprint},
                         timeout=settings.browser_timeout_ms,
                     )
+                    # 给 React/Ant Design 一次短暂的渲染稳定时间，再核验页码。
+                    await page_obj.wait_for_timeout(350)
+                    settled_page = await frame.locator(".ant-pagination-item-active").inner_text()
+                    if settled_page.strip() != str(expected_page):
+                        raise PlaywrightError("分页状态在数据更新后发生变化")
                 except PlaywrightError:
-                    raise HTTPException(status_code=504, detail=f"等待列表切换到第 {expected_page} 页超时。")
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"已触发翻页，但等待第 {expected_page} 页的新数据加载完成超时；为避免返回上一页数据，本次不返回表格结果。",
+                    )
                 current_page = expected_page
 
         try:
@@ -675,5 +737,5 @@ async def get_page_table(
             "rows": result["rows"],
             "row_count": len(result["rows"]),
             "pagination": result["pagination"],
-            "message": "已读取当前页可见表格数据；不传 page 参数不会切换网页分页。",
+            "message": "已读取当前激活标签页的表格数据；指定 page 时会等待目标页数据实际更新并退出加载状态后再读取，不传 page 参数不会切换网页分页。",
         }
