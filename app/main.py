@@ -10,16 +10,12 @@ from app.schemas import SiteCheckRequest, SiteCheckResponse
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await browser_manager.start(
-        headless=settings.browser_headless,
-        channel=settings.browser_channel,
-        user_data_dir=settings.browser_user_data_dir,
-    )
+    await browser_manager.start(cdp_url=settings.browser_cdp_url)
     yield
     await browser_manager.close()
 
 
-app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="0.6.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
