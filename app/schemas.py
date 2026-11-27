@@ -3,6 +3,18 @@ from typing import Literal
 from pydantic import BaseModel, Field, HttpUrl
 
 
+class BrowserOpenRequest(BaseModel):
+    url: HttpUrl = Field(..., description="需要在专用 Chrome 中打开的网页地址。")
+
+
+class BrowserOpenResponse(BaseModel):
+    status: Literal["opened", "error"]
+    message: str
+    final_url: str | None = None
+    page_title: str | None = None
+    http_status: int | None = None
+
+
 class SiteCheckRequest(BaseModel):
     operator: str = Field(..., min_length=1, max_length=50)
     url: HttpUrl
