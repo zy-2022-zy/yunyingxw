@@ -76,6 +76,7 @@ API 文档：http://127.0.0.1:8000/docs
 调用 `GET /api/browser/status` 查看当前连接状态。该接口只检查状态，不会为了检查而启动 Chrome。
 
 其他现有接口：
+- `POST /api/login`：使用本次请求提交的账号密码执行登录；凭据仅用于当前请求，不写入配置或文件。
 - `GET /api/health`：服务健康检查
 - `POST /api/site/check`：检查运营商网站可达性
 - `GET /api/page/dom`：读取当前页面 DOM 摘要
@@ -92,8 +93,21 @@ BROWSER_TIMEOUT_MS=20000
 
 停止服务：在运行服务的终端按 `Ctrl+C`。本服务启动的 Chrome 会随服务停止而关闭；如果服务连接的是事先手动启动的 CDP Chrome，则不会关闭该浏览器。
 
-请勿通过 API 提交账号密码、Cookie 或 Token。
+登录接口 `POST /api/login` 需要在本机调用，账号密码通过请求体传入，仅用于当前登录操作；不要将请求转发到公网或局域网，也不要提交 Cookie 或 Token。
+
+## 自动登录接口
+
+调用 `POST /api/login`，请求体示例：
+
+```json
+{
+  "username": "你的登录账号",
+  "password": "你的登录密码"
+}
+```
+
+接口会在专用 Chrome 中打开运营商登录页，填写 `#loginNumber`、`#password` 并点击登录。响应状态包括 `login_success`、`verification_required`、`login_failed`。账号密码不会写入项目文件或配置；请仅通过本机 `127.0.0.1` 调用，不要把请求体或凭据分享给他人。
 
 ## 当前版本
 
-v0.8.0：FastAPI 按需启动 Chrome，增加打开网页、浏览器状态和关闭后自动恢复能力；Git 提交说明统一使用中文。
+v0.9.0：增加运营商系统自动登录接口，支持请求时传入账号密码并返回登录状态。
