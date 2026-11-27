@@ -220,7 +220,7 @@ async def get_page_dom(
         description="是否返回完整 HTML。完整 HTML 可能包含业务数据，默认关闭。",
     ),
 ):
-    """读取当前页面及所有 Frame 的可见文本、交互元素和页面容器。"""
+    """接口用途：调试时读取当前页面及所有 Frame 的可见文本、交互元素和页面容器；不会读取输入框 value。"""
     from urllib.parse import urlsplit, urlunsplit
 
     def safe_frame_url(raw_url: str) -> str:
