@@ -532,25 +532,39 @@ async def get_page_table(
 
         # 默认不切换页面；只有明确传入 page 参数时才执行分页跳转。
         if page is not None:
+            # Ant Design 分页器只显示部分页码；逐页点击上一页/下一页，
+            # 因此即使目标页码暂时不在可见页码按钮中，也能读取几十页的数据。
             active_page = frame.locator(".ant-pagination-item-active")
-            active_text = (await active_page.first.inner_text()).strip() if await active_page.count() else ""
-            if active_text != str(page):
-                target_page = frame.locator(f'.ant-pagination-item[title="{page}"]')
-                target_count = await target_page.count()
-                if target_count != 1:
+            active_text = (await active_page.first.inner_text()).strip() if await active_page.count() else "1"
+            try:
+                current_page = int(active_text)
+            except ValueError:
+                current_page = 1
+
+            # 防止错误页码导致大量无意义点击；真实总页数稍后也会由表格元数据返回。
+            if page > 500:
+                raise HTTPException(status_code=400, detail="单次指定页码不能超过 500。")
+
+            while current_page != page:
+                direction = "next" if current_page < page else "prev"
+                pager_button = frame.locator(f".ant-pagination-{direction}")
+                if await pager_button.count() != 1 or "ant-pagination-disabled" in (await pager_button.get_attribute("class") or ""):
                     raise HTTPException(
                         status_code=404,
-                        detail=f"当前分页控件中未找到第 {page} 页；请确认目标页码在可用分页范围内。",
+                        detail=f"当前列表无法继续翻页，未能到达第 {page} 页；已停留在第 {current_page} 页。",
                     )
-                await target_page.click()
+                await wait_between_actions()
+                await pager_button.click()
+                expected_page = current_page + (1 if direction == "next" else -1)
                 try:
                     await frame.wait_for_function(
                         "(expected) => { const active = document.querySelector('.ant-pagination-item-active'); return active && active.textContent.trim() === String(expected); }",
-                        arg=page,
+                        arg=expected_page,
                         timeout=settings.browser_timeout_ms,
                     )
                 except PlaywrightError:
-                    raise HTTPException(status_code=504, detail=f"等待列表切换到第 {page} 页超时。")
+                    raise HTTPException(status_code=504, detail=f"等待列表切换到第 {expected_page} 页超时。")
+                current_page = expected_page
 
         try:
             result = await frame.evaluate(
