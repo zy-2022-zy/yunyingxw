@@ -119,7 +119,15 @@ async def login(payload: LoginRequest):
         try:
             page = await browser_manager.get_page(settings.browser_timeout_ms)
 
-            # 若当前页面已处于登录后的系统中，则复用现有会话，不重复填写账号密码。
+            # 新启动的专用 Chrome 通常是 about:blank，需要先打开登录页；
+            # 若当前已在运营商系统内，则复用现有登录会话。
+            if page.url == "about:blank" or "10.253.61.35" not in page.url:
+                await page.goto(
+                    "http://10.253.61.35/cmopchannel/login",
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
             if "login" in page.url.lower():
                 account_input = page.locator("#loginNumber")
                 password_input = page.locator("#password")
