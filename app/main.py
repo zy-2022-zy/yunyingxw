@@ -512,3 +512,123 @@ async def get_page_dom(
                 "已读取当前页面及所有 Frame 的可见文本、控件、可交互元素和页面容器；不会读取输入框 value，Frame URL 中的查询参数和片段已脱敏。"
             ),
         }
+
+
+
+@app.get("/api/page/table")
+async def get_page_table(
+    page: int | None = Query(
+        default=None,
+        ge=1,
+        description="可选页码；不传时只读取当前页，不改变网页当前分页。",
+    ),
+):
+    """接口用途：读取当前业务 Frame 中可见表格的数据；可选指定页码，为后续批量翻页读取预留能力。"""
+    async with browser_manager.operation_lock:
+        page_obj = await browser_manager.get_page(settings.browser_timeout_ms)
+        frame = await find_adcesop_frame(page_obj)
+        if frame is None:
+            raise HTTPException(status_code=404, detail="未找到业务系统 iframe（/adcesop）。")
+
+        # 默认不切换页面；只有明确传入 page 参数时才执行分页跳转。
+        if page is not None:
+            active_page = frame.locator(".ant-pagination-item-active")
+            active_text = (await active_page.first.inner_text()).strip() if await active_page.count() else ""
+            if active_text != str(page):
+                target_page = frame.locator(f'.ant-pagination-item[title="{page}"]')
+                target_count = await target_page.count()
+                if target_count != 1:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"当前分页控件中未找到第 {page} 页；请确认目标页码在可用分页范围内。",
+                    )
+                await target_page.click()
+                try:
+                    await frame.wait_for_function(
+                        "(expected) => { const active = document.querySelector('.ant-pagination-item-active'); return active && active.textContent.trim() === String(expected); }",
+                        arg=page,
+                        timeout=settings.browser_timeout_ms,
+                    )
+                except PlaywrightError:
+                    raise HTTPException(status_code=504, detail=f"等待列表切换到第 {page} 页超时。")
+
+        try:
+            result = await frame.evaluate(
+                """() => {
+                    const visible = el => {
+                        const style = getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            rect.width > 0 && rect.height > 0;
+                    };
+                    const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+                    const tables = [...document.querySelectorAll('.ant-table-wrapper table, table')]
+                        .filter(visible);
+                    const table = tables[0];
+                    if (!table) {
+                        return {found: false, columns: [], rows: [], pagination: null};
+                    }
+
+                    const headerRow = table.querySelector('thead tr:last-child');
+                    const headerCells = headerRow ? [...headerRow.querySelectorAll('th')] : [];
+                    const columns = headerCells.map((cell, index) => clean(cell.innerText) || ('列_' + (index + 1)));
+                    const bodyRows = [...table.querySelectorAll('tbody tr')]
+                        .filter(visible)
+                        .filter(row => !row.classList.contains('ant-table-placeholder'));
+                    const rows = bodyRows.map(row => {
+                        const cells = [...row.querySelectorAll(':scope > td')];
+                        const values = cells.map(cell => clean(cell.innerText));
+                        const record = {};
+                        values.forEach((value, index) => {
+                            const key = columns[index] || ('列_' + (index + 1));
+                            record[key] = value;
+                        });
+                        return record;
+                    });
+
+                    const active = document.querySelector('.ant-pagination-item-active');
+                    const currentPage = active ? Number(clean(active.innerText)) || 1 : 1;
+                    const totalText = clean(document.querySelector('.ant-pagination-total-text')?.innerText);
+                    const totalMatch = totalText.match(/(?:共)?\\s*(\\d+)\\s*条/);
+                    const total = totalMatch ? Number(totalMatch[1]) : null;
+                    const sizeText = clean(document.querySelector('.ant-pagination-options-size-changer .ant-select-selection-selected-value')?.innerText ||
+                        document.querySelector('.ant-pagination-options-size-changer .ant-select-selection')?.innerText);
+                    const sizeMatch = sizeText.match(/(\\d+)/);
+                    const pageSize = sizeMatch ? Number(sizeMatch[1]) : rows.length;
+                    const pageItems = [...document.querySelectorAll('.ant-pagination-item')]
+                        .map(item => Number(item.getAttribute('title') || clean(item.innerText)))
+                        .filter(number => Number.isInteger(number) && number > 0);
+                    const lastVisiblePage = pageItems.length ? Math.max(...pageItems) : currentPage;
+                    const totalPages = total !== null && pageSize > 0
+                        ? Math.ceil(total / pageSize)
+                        : lastVisiblePage;
+                    return {
+                        found: true,
+                        columns,
+                        rows,
+                        pagination: {
+                            current_page: currentPage,
+                            page_size: pageSize,
+                            total,
+                            total_pages: totalPages,
+                            has_previous: currentPage > 1,
+                            has_next: total !== null ? currentPage < totalPages : currentPage < lastVisiblePage
+                        }
+                    };
+                }"""
+            )
+        except PlaywrightError as exc:
+            raise HTTPException(status_code=502, detail="读取网页表格失败：" + str(exc)[:300]) from exc
+
+        if not result.get("found"):
+            raise HTTPException(status_code=404, detail="当前业务页面没有找到可见表格。")
+
+        return {
+            "url": page_obj.url.split("?", 1)[0].split("#", 1)[0],
+            "frame": "adcesop",
+            "columns": result["columns"],
+            "rows": result["rows"],
+            "row_count": len(result["rows"]),
+            "pagination": result["pagination"],
+            "message": "已读取当前页可见表格数据；不传 page 参数不会切换网页分页。",
+        }
