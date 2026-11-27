@@ -5,10 +5,8 @@ class Settings(BaseSettings):
     app_name: str = "运营商报备自动化助手"
     app_host: str = "127.0.0.1"
     app_port: int = 8000
-    browser_headless: bool = False
-    browser_channel: str = "chrome"
     browser_timeout_ms: int = 20_000
-    browser_user_data_dir: str = ".browser-profile"
+    browser_cdp_url: str = "http://127.0.0.1:9222"
 
     model_config = SettingsConfigDict(
         env_file=".env",
