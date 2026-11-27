@@ -13,12 +13,13 @@ async def lifespan(app: FastAPI):
     await browser_manager.start(
         headless=settings.browser_headless,
         channel=settings.browser_channel,
+        user_data_dir=settings.browser_user_data_dir,
     )
     yield
     await browser_manager.close()
 
 
-app = FastAPI(title=settings.app_name, version="0.3.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="0.5.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
@@ -29,7 +30,6 @@ async def health():
 @app.post("/api/site/check", response_model=SiteCheckResponse)
 async def check_site(payload: SiteCheckRequest):
     """通过持久化的本机浏览器页面访问目标站点，验证当前 VPN/网络是否可达。"""
-    # 共享页面需要串行使用，防止并发请求互相覆盖导航和页面内容。
     async with browser_manager.operation_lock:
         page = await browser_manager.get_page(settings.browser_timeout_ms)
         try:
@@ -53,10 +53,29 @@ async def check_site(payload: SiteCheckRequest):
                     http_status=status_code,
                 )
 
-            if status_code in (401, 403) or any(
-                marker in final_url.lower()
-                for marker in ("login", "signin", "sso")
-            ):
+            if status_code is not None and 400 <= status_code < 500:
+                if status_code in (401, 403) or any(
+                    marker in final_url.lower()
+                    for marker in ("login", "signin", "sso")
+                ):
+                    status = "login_required"
+                    message = "目标网站可以访问，但当前可能尚未登录或无权访问。"
+                else:
+                    status = "http_error"
+                    message = f"浏览器已连接到目标网站，但网站返回 HTTP {status_code}，页面不能视为正常打开。"
+
+                return SiteCheckResponse(
+                    operator=payload.operator,
+                    status=status,
+                    reachable=True,
+                    message=message,
+                    final_url=final_url,
+                    page_title=title,
+                    http_status=status_code,
+                    detail=f"目标网站返回 HTTP {status_code}",
+                )
+
+            if any(marker in final_url.lower() for marker in ("login", "signin", "sso")):
                 return SiteCheckResponse(
                     operator=payload.operator,
                     status="login_required",
@@ -185,8 +204,3 @@ async def get_page_dom(
                 else "已读取当前页面 DOM 和完整 HTML；请注意 HTML 可能包含页面业务数据。"
             ),
         }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host=settings.app_host, port=settings.app_port, reload=True)
