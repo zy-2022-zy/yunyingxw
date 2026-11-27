@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import Error as PlaywrightError
 
 from app.browser import browser_manager
+from app.action_pacing import wait_between_actions
 from app.config import settings
 from app.schemas import (
     BrowserOpenRequest,
@@ -59,6 +60,7 @@ async def open_product_order_application(page, timeout_ms: int):
         return False, f"主页面中找到 {my_products_count} 个“我的产品”菜单项，无法安全确定点击目标。"
 
     await my_products.click(timeout=timeout_ms)
+    await wait_between_actions()
 
     # 点击菜单后业务内容可能异步加载到 Frame，继续跨 Frame 等待目标入口。
     deadline_ms = 25_000
@@ -66,6 +68,7 @@ async def open_product_order_application(page, timeout_ms: int):
     while elapsed_ms < deadline_ms:
         target_frame, target = await find_unique_visible_text(page, "产品订购申请")
         if target_frame is not None:
+            await wait_between_actions()
             await target.click(timeout=timeout_ms)
             return True, "已点击主页面“我的产品”，并打开“产品订购申请”。"
         if target > 1:
@@ -146,7 +149,9 @@ async def login(payload: LoginRequest):
                 await account_input.wait_for(state="visible")
                 await password_input.wait_for(state="visible")
                 await account_input.fill(payload.username)
+                await wait_between_actions()
                 await password_input.fill(payload.password.get_secret_value())
+                await wait_between_actions()
                 await page.locator('button[type="submit"]').click()
 
                 try:
