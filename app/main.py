@@ -1,19 +1,15 @@
+import re
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from playwright.async_api import Error as PlaywrightError
 
 from app.browser import browser_manager
 from app.action_pacing import wait_between_actions
 from app.config import settings
-from app.schemas import (
-    BrowserOpenRequest,
-    BrowserOpenResponse,
-    SiteCheckRequest,
-    SiteCheckResponse,
-    LoginRequest,
-    LoginResponse,
-)
 
 
 @asynccontextmanager
@@ -28,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 
 
-app = FastAPI(title=settings.app_name, version="0.8.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
 
 
 async def find_unique_visible_text(page, text):
@@ -91,51 +87,76 @@ async def open_product_order_application(page, timeout_ms: int):
 
 @app.get("/api/health")
 async def health():
+    """接口用途：供部署平台或上游 Agent 检查 FastAPI 服务是否正常运行。"""
     return {"ok": True, "service": settings.app_name}
 
 
 @app.get("/api/browser/status")
 async def get_browser_status():
-    """查看浏览器状态；此接口不会为了检查状态而启动 Chrome。"""
+    """接口用途：查看专用 Chrome/CDP 连接状态；不会主动启动浏览器。"""
     return browser_manager.status()
 
 
-@app.post("/api/browser/open", response_model=BrowserOpenResponse)
-async def open_browser_page(payload: BrowserOpenRequest):
-    """按需启动或恢复专用 Chrome，并打开指定网页。"""
-    async with browser_manager.operation_lock:
+@app.post("/api/product-order/batch-import")
+async def receive_batch_import_task(
+    task_id: str = Form(..., min_length=1, max_length=64, description="上游 Agent 生成的唯一任务编号。"),
+    username: str = Form(..., min_length=1, max_length=100, description="运营商系统登录账号，仅用于本次任务。"),
+    password: str = Form(..., min_length=1, description="运营商系统登录密码，仅用于本次任务，不保存。"),
+    si_code: str = Form(..., min_length=1, max_length=100, description="预期 SI 编码，用于后续页面校验。"),
+    product_name: str = Form(..., min_length=1, max_length=200, description="预期产品名称，用于后续页面校验。"),
+    business_name: str = Form(..., min_length=1, max_length=200, description="预期业务名称，用于后续页面校验。"),
+    excel_file: UploadFile = File(..., description="批量导入 Excel 文件。"),
+    attachment_file: UploadFile = File(..., description="业务附件文件。"),
+):
+    """接口用途：接收上游 Agent 的完整订购任务，安全暂存两个文件，并登录进入产品订购申请页面。
+    当前版本只完成任务接收和页面准备，不会上传文件到运营商或点击业务确认。
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", task_id):
+        raise HTTPException(status_code=400, detail="task_id 仅允许字母、数字、下划线和短横线。")
+
+    allowed_excel = {".xlsx", ".xls"}
+    allowed_attachment = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".jpg", ".jpeg", ".png"}
+    excel_suffix = Path(excel_file.filename or "").suffix.lower()
+    attachment_suffix = Path(attachment_file.filename or "").suffix.lower()
+    if excel_suffix not in allowed_excel:
+        raise HTTPException(status_code=400, detail="批量导入文件仅支持 .xlsx 或 .xls 格式。")
+    if attachment_suffix not in allowed_attachment:
+        raise HTTPException(status_code=400, detail="附件格式暂不支持，请使用 PDF、Office、压缩包或常见图片格式。")
+
+    task_dir = Path(tempfile.gettempdir()) / "yunyingxw_tasks" / task_id
+    if task_dir.exists():
+        raise HTTPException(status_code=409, detail="该 task_id 已存在，请使用新的唯一任务编号。")
+    task_dir.mkdir(parents=True, exist_ok=False)
+
+    async def save_upload(upload: UploadFile, destination: Path) -> int:
+        """分块保存上游文件并限制单个文件大小，避免一次性读入内存。"""
+        max_file_size = 50 * 1024 * 1024
+        total = 0
         try:
+            with destination.open("wb") as output:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_file_size:
+                        raise HTTPException(status_code=413, detail="单个上传文件不能超过 50 MB。")
+                    output.write(chunk)
+        finally:
+            await upload.close()
+        if total == 0:
+            raise HTTPException(status_code=400, detail="不允许上传空文件。")
+        return total
+
+    try:
+        excel_path = task_dir / ("批量导入" + excel_suffix)
+        attachment_path = task_dir / ("业务附件" + attachment_suffix)
+        excel_size = await save_upload(excel_file, excel_path)
+        attachment_size = await save_upload(attachment_file, attachment_path)
+
+        # 一个业务任务独占浏览器操作锁，避免不同任务交叉操作同一 Chrome 页面。
+        async with browser_manager.operation_lock:
             page = await browser_manager.get_page(settings.browser_timeout_ms)
-            response = await page.goto(
-                str(payload.url),
-                wait_until="domcontentloaded",
-                timeout=settings.browser_timeout_ms,
-            )
-            return BrowserOpenResponse(
-                status="opened",
-                message="网页已在专用 Chrome 中打开。",
-                final_url=page.url,
-                page_title=await page.title(),
-                http_status=response.status if response else None,
-            )
-        except PlaywrightError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"浏览器已启动或正在恢复，但打开网页失败：{str(exc)[:500]}",
-            ) from exc
-        except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@app.post("/api/login", response_model=LoginResponse)
-async def login(payload: LoginRequest):
-    """登录运营商系统，并自动进入“我的产品 -> 产品订购申请”。"""
-    async with browser_manager.operation_lock:
-        try:
-            page = await browser_manager.get_page(settings.browser_timeout_ms)
-
-            # 新启动的专用 Chrome 通常是 about:blank，需要先打开登录页；
-            # 若当前已在运营商系统内，则复用现有登录会话。
             if page.url == "about:blank" or "10.253.61.35" not in page.url:
                 await page.goto(
                     "http://10.253.61.35/cmopchannel/login",
@@ -144,16 +165,11 @@ async def login(payload: LoginRequest):
                 )
 
             if "login" in page.url.lower():
-                account_input = page.locator("#loginNumber")
-                password_input = page.locator("#password")
-                await account_input.wait_for(state="visible")
-                await password_input.wait_for(state="visible")
-                await account_input.fill(payload.username)
+                await page.locator("#loginNumber").fill(username)
                 await wait_between_actions()
-                await password_input.fill(payload.password.get_secret_value())
+                await page.locator("#password").fill(password)
                 await wait_between_actions()
                 await page.locator('button[type="submit"]').click()
-
                 try:
                     await page.wait_for_url(
                         lambda url: "login" not in str(url).lower(),
@@ -162,159 +178,39 @@ async def login(payload: LoginRequest):
                 except PlaywrightError:
                     pass
 
-            final_url = page.url
-            title = await page.title()
-            if "login" in final_url.lower():
-                body_text = (await page.locator("body").inner_text())[:2000]
-                if any(word in body_text for word in ("验证码", "短信", "验证", "安全校验")):
-                    return LoginResponse(
-                        status="verification_required",
-                        message="页面仍停留在登录页，可能需要完成验证码或其他人工验证。",
-                        final_url=final_url,
-                        page_title=title,
-                        current_step="登录验证",
-                    )
-                return LoginResponse(
-                    status="login_failed",
-                    message="登录后仍停留在登录页，请检查账号密码或页面提示。",
-                    final_url=final_url,
-                    page_title=title,
-                    current_step="登录",
-                )
+            if "login" in page.url.lower():
+                raise HTTPException(status_code=401, detail="登录未成功，页面仍停留在登录页；请检查账号或完成页面验证。")
 
-            # 登录成功后自动进入产品订购申请入口。
-            try:
-                opened, message = await open_product_order_application(
-                    page, settings.browser_timeout_ms
-                )
-            except PlaywrightError as exc:
-                opened, message = False, f"自动点击页面入口失败：{str(exc)[:300]}"
-
-            return LoginResponse(
-                status="login_success" if opened else "navigation_failed",
-                message=message,
-                final_url=page.url,
-                page_title=await page.title(),
-                current_step="产品订购申请" if opened else "进入产品订购申请失败",
+            opened, message = await open_product_order_application(
+                page, settings.browser_timeout_ms
             )
-        except PlaywrightError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"自动化登录或页面导航失败：{str(exc)[:300]}",
-            ) from exc
-        except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if not opened:
+                raise HTTPException(status_code=502, detail=message)
 
-
-@app.post("/api/site/check", response_model=SiteCheckResponse)
-async def check_site(payload: SiteCheckRequest):
-    """通过持久化的本机浏览器页面访问目标站点，验证当前 VPN/网络是否可达。"""
-    async with browser_manager.operation_lock:
-        page = await browser_manager.get_page(settings.browser_timeout_ms)
-        try:
-            response = await page.goto(
-                str(payload.url),
-                wait_until="domcontentloaded",
-                timeout=settings.browser_timeout_ms,
-            )
-            title = await page.title()
-            final_url = page.url
-            status_code = response.status if response else None
-
-            if status_code is not None and status_code >= 500:
-                return SiteCheckResponse(
-                    operator=payload.operator,
-                    status="site_error",
-                    reachable=True,
-                    message="网络已到达目标网站，但网站服务器返回错误。",
-                    final_url=final_url,
-                    page_title=title,
-                    http_status=status_code,
-                )
-
-            if status_code is not None and 400 <= status_code < 500:
-                if status_code in (401, 403) or any(
-                    marker in final_url.lower()
-                    for marker in ("login", "signin", "sso")
-                ):
-                    status = "login_required"
-                    message = "目标网站可以访问，但当前可能尚未登录或无权访问。"
-                else:
-                    status = "http_error"
-                    message = f"浏览器已连接到目标网站，但网站返回 HTTP {status_code}，页面不能视为正常打开。"
-
-                return SiteCheckResponse(
-                    operator=payload.operator,
-                    status=status,
-                    reachable=True,
-                    message=message,
-                    final_url=final_url,
-                    page_title=title,
-                    http_status=status_code,
-                    detail=f"目标网站返回 HTTP {status_code}",
-                )
-
-            if any(marker in final_url.lower() for marker in ("login", "signin", "sso")):
-                return SiteCheckResponse(
-                    operator=payload.operator,
-                    status="login_required",
-                    reachable=True,
-                    message="目标网站可以访问，但当前可能尚未登录。",
-                    final_url=final_url,
-                    page_title=title,
-                    http_status=status_code,
-                )
-
-            if payload.expected_text:
-                body_text = await page.locator("body").inner_text()
-                if payload.expected_text not in body_text:
-                    return SiteCheckResponse(
-                        operator=payload.operator,
-                        status="page_unexpected",
-                        reachable=True,
-                        message="网站已打开，但没有找到预期页面内容，请检查页面是否加载完整。",
-                        final_url=final_url,
-                        page_title=title,
-                        http_status=status_code,
-                        detail="未找到配置的 expected_text",
-                    )
-
-            return SiteCheckResponse(
-                operator=payload.operator,
-                status="reachable",
-                reachable=True,
-                message="目标网站已成功打开，可以继续后续自动化操作。",
-                final_url=final_url,
-                page_title=title,
-                http_status=status_code,
-            )
-
-        except PlaywrightError as exc:
-            message = str(exc)
-            lowered = message.lower()
-            if any(term in lowered for term in (
-                "name_not_resolved",
-                "err_name_not_resolved",
-                "connection_refused",
-                "err_connection",
-                "timed out",
-                "timeout",
-                "net::err",
-            )):
-                status = "vpn_or_network_unavailable"
-                friendly = "暂时无法访问目标网站。请检查 VPN 是否已连接，以及当前网络是否允许访问该运营商系统。"
-            else:
-                status = "site_error"
-                friendly = "访问目标网站时发生浏览器错误，请检查网址或稍后重试。"
-
-            return SiteCheckResponse(
-                operator=payload.operator,
-                status=status,
-                reachable=False,
-                message=friendly,
-                final_url=page.url,
-                detail=message[:1000],
-            )
+        # 不返回本机绝对路径，也不保存账号密码；后续上传阶段通过 task_id 找到暂存文件。
+        return {
+            "task_id": task_id,
+            "status": "files_received_page_ready",
+            "message": "任务信息和两个文件已接收，浏览器已进入产品订购申请页面；尚未向运营商上传或提交业务。",
+            "files": {
+                "excel": {"filename": excel_file.filename, "size_bytes": excel_size},
+                "attachment": {"filename": attachment_file.filename, "size_bytes": attachment_size},
+            },
+            "product_info": {
+                "si_code": si_code,
+                "product_name": product_name,
+                "business_name": business_name,
+            },
+        }
+    except HTTPException:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise
+    except (PlaywrightError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise HTTPException(status_code=502, detail="任务接收或页面准备失败：" + str(exc)[:400]) from exc
+    except Exception:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise
 
 
 @app.get("/api/page/dom")
