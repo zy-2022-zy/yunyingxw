@@ -172,14 +172,17 @@ class BrowserManager:
         }
 
     async def close(self) -> None:
-        """断开 Playwright，并仅关闭由本服务启动的 Chrome。"""
+        """停止服务时只断开 Playwright，不关闭 Chrome，以保留浏览器登录会话。"""
         if self._playwright:
             await self._playwright.stop()
         self._playwright = None
         self._browser = None
         self._context = None
         self._page = None
-        await self._stop_owned_chrome()
+        # 故意不调用 _stop_owned_chrome()：
+        # Chrome 使用固定 user_data_dir，留在后台可让下次启动服务时复用原登录态。
+        # 用户仍可手动关闭专用 Chrome；若 Chrome 被关闭，下次请求会自动重新启动。
+        self._chrome_process = None
 
 
 browser_manager = BrowserManager()
