@@ -44,20 +44,17 @@ python run.py
 
 ## 上游 Agent 调用方式
 
-调用 `POST /api/product-order/batch-import`，使用 `multipart/form-data`，字段如下：
+调用 `POST /api/product-order/batch-import`，使用 `multipart/form-data`，当前只需要传入以下五个字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| task_id | 文本 | 上游生成的唯一任务编号，仅允许字母、数字、下划线和短横线 |
+| url | 文本 | 运营商系统登录页或入口 URL；服务收到任务后会先打开该地址 |
 | username | 文本 | 运营商登录账号 |
 | password | 文本 | 运营商登录密码，仅用于本次请求 |
-| si_code | 文本 | 预期 SI 编码 |
-| product_name | 文本 | 预期产品名称 |
-| business_name | 文本 | 预期业务名称 |
 | excel_file | 文件 | 批量导入 Excel，支持 .xls、.xlsx |
 | attachment_file | 文件 | 业务附件，支持 PDF、Office、压缩包及常见图片格式 |
 
-文件大小限制：每个文件最大 50 MB。重复的 task_id 会返回 HTTP 409，调用方应为每次新任务生成唯一编号。
+任务编号由服务端自动生成，上游无需传入 task_id。
 
 成功响应状态为 `files_received_page_ready`，表示任务字段和两个文件已接收，浏览器已进入“产品订购申请”页面。响应不会返回本机文件绝对路径，也不会回显密码。
 
@@ -68,7 +65,9 @@ python run.py
 ```powershell
 $uri = "http://127.0.0.1:8000/api/product-order/batch-import"
 $form = @{
-  task_id = "test_20261127_001"
+  url = "http://10.253.61.35/cmopchannel/login"
+  username = "测试账号"
+  password = "测试密码"
   username = "测试账号"
   password = "测试密码"
   si_code = "201230033"
