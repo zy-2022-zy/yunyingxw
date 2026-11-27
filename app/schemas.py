@@ -14,7 +14,7 @@ class SiteCheckRequest(BaseModel):
 
 class SiteCheckResponse(BaseModel):
     operator: str
-    status: Literal["reachable", "vpn_or_network_unavailable", "site_error", "login_required", "page_unexpected"]
+    status: Literal["reachable", "vpn_or_network_unavailable", "site_error", "http_error", "login_required", "page_unexpected"]
     reachable: bool
     message: str
     final_url: str | None = None
