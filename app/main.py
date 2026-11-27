@@ -1,6 +1,8 @@
 import json
-import re
 import shutil
+import uuid
+from urllib.parse import urlsplit
+
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -100,20 +102,21 @@ async def get_browser_status():
 
 @app.post("/api/product-order/batch-import")
 async def receive_batch_import_task(
-    task_id: str = Form(..., min_length=1, max_length=64, description="上游 Agent 生成的唯一任务编号。"),
+    url: str = Form(..., min_length=1, description="运营商系统登录页或入口 URL。"),
     username: str = Form(..., min_length=1, max_length=100, description="运营商系统登录账号，仅用于本次任务。"),
     password: str = Form(..., min_length=1, description="运营商系统登录密码，仅用于本次任务，不保存。"),
-    si_code: str = Form(..., min_length=1, max_length=100, description="预期 SI 编码，用于后续页面校验。"),
-    product_name: str = Form(..., min_length=1, max_length=200, description="预期产品名称，用于后续页面校验。"),
-    business_name: str = Form(..., min_length=1, max_length=200, description="预期业务名称，用于后续页面校验。"),
     excel_file: UploadFile = File(..., description="批量导入 Excel 文件。"),
     attachment_file: UploadFile = File(..., description="业务附件文件。"),
 ):
-    """接口用途：接收上游 Agent 的完整订购任务，安全暂存两个文件，并登录进入产品订购申请页面。
+    """接口用途：接收上游 Agent 传入的目标 URL、登录凭据和两个业务文件，暂存文件并打开目标登录页、登录后进入产品订购申请页面。
     当前版本只完成任务接收和页面准备，不会上传文件到运营商或点击业务确认。
     """
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", task_id):
-        raise HTTPException(status_code=400, detail="task_id 仅允许字母、数字、下划线和短横线。")
+    parsed_url = urlsplit(url.strip())
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        raise HTTPException(status_code=400, detail="url 必须是有效的 http 或 https 地址。")
+
+    # 上游暂不需要传 task_id，由服务端生成独立任务编号。
+    task_id = uuid.uuid4().hex
 
     allowed_excel = {".xlsx", ".xls"}
     allowed_attachment = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".jpg", ".jpeg", ".png"}
@@ -125,8 +128,6 @@ async def receive_batch_import_task(
         raise HTTPException(status_code=400, detail="附件格式暂不支持，请使用 PDF、Office、压缩包或常见图片格式。")
 
     task_dir = Path(tempfile.gettempdir()) / "yunyingxw_tasks" / task_id
-    if task_dir.exists():
-        raise HTTPException(status_code=409, detail="该 task_id 已存在，请使用新的唯一任务编号。")
     task_dir.mkdir(parents=True, exist_ok=False)
 
     async def save_upload(upload: UploadFile, destination: Path) -> int:
@@ -155,12 +156,10 @@ async def receive_batch_import_task(
         excel_size = await save_upload(excel_file, excel_path)
         attachment_size = await save_upload(attachment_file, attachment_path)
 
-        # 保存不含账号密码的任务元数据，供后续网页上传阶段按 task_id 读取。
+        # 保存不含账号密码和敏感 URL 参数的任务元数据，供后续网页上传阶段读取。
         task_metadata = {
             "task_id": task_id,
-            "si_code": si_code,
-            "product_name": product_name,
-            "business_name": business_name,
+            "target_origin": parsed_url.scheme + "://" + parsed_url.netloc,
             "excel_filename": excel_file.filename,
             "attachment_filename": attachment_file.filename,
             "excel_size_bytes": excel_size,
@@ -175,12 +174,13 @@ async def receive_batch_import_task(
         # 一个业务任务独占浏览器操作锁，避免不同任务交叉操作同一 Chrome 页面。
         async with browser_manager.operation_lock:
             page = await browser_manager.get_page(settings.browser_timeout_ms)
-            if page.url == "about:blank" or "10.253.61.35" not in page.url:
-                await page.goto(
-                    "http://10.253.61.35/cmopchannel/login",
-                    wait_until="domcontentloaded",
-                    timeout=settings.browser_timeout_ms,
-                )
+
+            # 每个任务都使用上游传入的 URL 打开目标登录页/系统入口。
+            await page.goto(
+                url.strip(),
+                wait_until="domcontentloaded",
+                timeout=settings.browser_timeout_ms,
+            )
 
             if "login" in page.url.lower():
                 await page.locator("#loginNumber").fill(username)
@@ -190,7 +190,7 @@ async def receive_batch_import_task(
                 await page.locator('button[type="submit"]').click()
                 try:
                     await page.wait_for_url(
-                        lambda url: "login" not in str(url).lower(),
+                        lambda current_url: "login" not in str(current_url).lower(),
                         timeout=15_000,
                     )
                 except PlaywrightError:
@@ -213,11 +213,6 @@ async def receive_batch_import_task(
             "files": {
                 "excel": {"filename": excel_file.filename, "size_bytes": excel_size},
                 "attachment": {"filename": attachment_file.filename, "size_bytes": attachment_size},
-            },
-            "product_info": {
-                "si_code": si_code,
-                "product_name": product_name,
-                "business_name": business_name,
             },
         }
     except HTTPException:
