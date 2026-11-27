@@ -13,11 +13,15 @@ class BrowserManager:
         # 同一浏览器页面同一时间只执行一个任务，避免多个请求互相干扰。
         self.operation_lock = asyncio.Lock()
 
-    async def start(self, headless: bool = False) -> None:
+    async def start(self, headless: bool = False, channel: str = "chrome") -> None:
         if self._browser and self._browser.is_connected():
             return
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=headless)
+        # 使用本机安装的 Chrome，便于复用其浏览器运行环境和企业策略。
+        self._browser = await self._playwright.chromium.launch(
+            headless=headless,
+            channel=channel,
+        )
         self._page = None
 
     async def get_page(self, timeout_ms: int = 20_000) -> Page:
