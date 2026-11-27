@@ -10,7 +10,10 @@ from app.schemas import SiteCheckRequest, SiteCheckResponse
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await browser_manager.start(headless=settings.browser_headless)
+    await browser_manager.start(
+        headless=settings.browser_headless,
+        channel=settings.browser_channel,
+    )
     yield
     await browser_manager.close()
 
