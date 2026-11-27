@@ -88,6 +88,120 @@ async def open_product_order_application(page, timeout_ms: int):
     return False, f"已点击“我的产品”，但等待 25 秒仍未找到“产品订购申请”入口。当前页面内容：{summary}"
 
 
+def safe_original_name(raw: str | None, fallback: str) -> str:
+    """保留上游原始文件名并去掉路径和非法字符；弹窗和业务列表会展示该文件名。"""
+    name = Path(raw or "").name.strip()
+    name = "".join(ch for ch in name if ch not in '\\/:*?"<>|\r\n\t')
+    name = name.strip()
+    return (name[:120]) if name else fallback
+
+
+async def find_adcesop_frame(page):
+    """定位业务系统 iframe（ADC 承载批量导入页面）。"""
+    for frame in page.frames:
+        if "/adcesop" in frame.url:
+            return frame
+    return None
+
+
+async def submit_batch_import_popup(page, excel_path: Path, attachment_path: Path, timeout_ms: int):
+    """在产品订购申请页面点击“批量导入订购申请”，上传 Excel 与附件并点击确认。
+
+    页面结构来自 /api/page/dom 实测：
+    - 业务内容在 /adcesop iframe 内，入口为文本“批量导入订购申请”的按钮；
+    - 弹窗标题“批量新增产品订购申请”，内含两个 input[type=file]（Excel 在前、附件在后）；
+    - 底部为“确 认”主按钮和“取 消”按钮。
+    """
+    frame = await find_adcesop_frame(page)
+    if frame is None:
+        return False, "未找到业务系统 iframe（/adcesop），无法执行批量导入。"
+
+    # 1. 点击列表页的“批量导入订购申请”入口按钮。
+    entry = frame.get_by_role("button", name="批量导入订购申请")
+    try:
+        await entry.wait_for(state="visible", timeout=timeout_ms)
+    except PlaywrightError:
+        return False, "产品订购申请列表页上未找到“批量导入订购申请”按钮。"
+    entry_count = await entry.count()
+    if entry_count != 1:
+        return False, f"“批量导入订购申请”按钮匹配到 {entry_count} 个元素，避免误点已中止。"
+    await entry.click(timeout=timeout_ms)
+    await wait_between_actions()
+
+    # 2. 等待“批量新增产品订购申请”弹窗出现；hash 类名不稳定，用标题文本定位。
+    modal = frame.locator(".ant-modal", has=frame.get_by_text("批量新增产品订购申请", exact=True))
+    try:
+        await modal.wait_for(state="visible", timeout=timeout_ms)
+    except PlaywrightError:
+        return False, "点击入口按钮后未出现“批量新增产品订购申请”弹窗。"
+
+    # 3. 填入两个文件：第一个是批量导入 Excel，第二个是附件。
+    file_inputs = modal.locator('input[type="file"]')
+    input_count = await file_inputs.count()
+    if input_count < 2:
+        return False, f"弹窗内只找到 {input_count} 个文件输入框，预期 2 个（Excel 和附件）。"
+    try:
+        await file_inputs.nth(0).set_input_files(str(excel_path), timeout=timeout_ms)
+        await wait_between_actions()
+        await file_inputs.nth(1).set_input_files(str(attachment_path), timeout=timeout_ms)
+    except PlaywrightError as exc:
+        return False, "向弹窗文件输入框写入文件失败：" + str(exc)[:300]
+
+    # 4. 等待两个文件都上传完成：antd 的“未选择任何文件”提示消失、文件名出现在弹窗内。
+    deadline_ms = 60_000
+    elapsed_ms = 0
+    while elapsed_ms < deadline_ms:
+        modal_text = await modal.inner_text()
+        if "未选择任何文件" not in modal_text:
+            break
+        await page.wait_for_timeout(500)
+        elapsed_ms += 500
+    else:
+        return False, "等待 60 秒后弹窗仍显示“未选择任何文件”，文件可能上传失败。"
+
+    # 确认弹窗中能同时看到两个文件名，避免只传成功一个就提交。
+    if excel_path.name not in await modal.inner_text():
+        return False, f"弹窗中未看到 Excel 文件名（{excel_path.name}），上传结果未知，已中止提交。"
+    if attachment_path.name not in await modal.inner_text():
+        return False, f"弹窗中未看到附件文件名（{attachment_path.name}），上传结果未知，已中止提交。"
+    await wait_between_actions()
+
+    # 5. 点击弹窗底部“确 认”按钮提交。
+    confirm = modal.locator(".ant-modal-footer button", has_text="确 认")
+    confirm_count = await confirm.count()
+    if confirm_count != 1:
+        return False, f"弹窗底部“确 认”按钮匹配到 {confirm_count} 个元素，避免误点已中止。"
+    await confirm.click(timeout=timeout_ms)
+
+    # 6. 等待弹窗关闭，并收集页面提示（成功或错误信息）。
+    try:
+        await modal.wait_for(state="hidden", timeout=30_000)
+        closed = True
+    except PlaywrightError:
+        closed = False
+    await page.wait_for_timeout(1_000)
+
+    notice_texts = []
+    notices = frame.locator(".ant-message-notice, .ant-modal-confirm")
+    try:
+        notice_count = await notices.count()
+        for index in range(min(notice_count, 5)):
+            text = (await notices.nth(index).inner_text()).strip()
+            if text:
+                notice_texts.append(text[:200])
+    except PlaywrightError:
+        pass
+
+    if not closed:
+        detail = "；".join(notice_texts) or "弹窗未关闭，可能存在校验错误。"
+        return False, "点击确认后 30 秒弹窗仍未关闭：" + detail[:400]
+
+    message = "已上传 Excel 与附件并点击确认，弹窗已关闭。"
+    if notice_texts:
+        message += "页面提示：" + "；".join(notice_texts)[:300]
+    return True, message
+
+
 @app.get("/api/health")
 async def health():
     """接口用途：供部署平台或上游 Agent 检查 FastAPI 服务是否正常运行。"""
@@ -108,8 +222,8 @@ async def receive_batch_import_task(
     excel_file: UploadFile = File(..., description="批量导入 Excel 文件。"),
     attachment_file: UploadFile = File(..., description="业务附件文件。"),
 ):
-    """接口用途：接收上游 Agent 传入的目标 URL、登录凭据和两个业务文件，暂存文件并打开目标登录页、登录后进入产品订购申请页面。
-    当前版本只完成任务接收和页面准备，不会上传文件到运营商或点击业务确认。
+    """接口用途：接收上游 Agent 传入的目标 URL、登录凭据和两个业务文件，暂存文件并打开目标登录页；
+    登录后进入产品订购申请页面，点击“批量导入订购申请”，在弹窗中上传 Excel 与附件并点击确认。
     """
     parsed_url = urlsplit(url.strip())
     if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
@@ -151,8 +265,9 @@ async def receive_batch_import_task(
         return total
 
     try:
-        excel_path = task_dir / ("批量导入" + excel_suffix)
-        attachment_path = task_dir / ("业务附件" + attachment_suffix)
+        # 保留原始文件名：弹窗与业务列表会按文件名展示“批量导入文件名”，改名会影响业务展示。
+        excel_path = task_dir / safe_original_name(excel_file.filename, "批量导入" + excel_suffix)
+        attachment_path = task_dir / safe_original_name(attachment_file.filename, "业务附件" + attachment_suffix)
         excel_size = await save_upload(excel_file, excel_path)
         attachment_size = await save_upload(attachment_file, attachment_path)
 
@@ -205,11 +320,24 @@ async def receive_batch_import_task(
             if not opened:
                 raise HTTPException(status_code=502, detail=message)
 
-        # 不返回本机绝对路径，也不保存账号密码；后续上传阶段通过 task_id 找到暂存文件。
+            submitted, upload_message = await submit_batch_import_popup(
+                page, excel_path, attachment_path, settings.browser_timeout_ms
+            )
+            if not submitted:
+                raise HTTPException(status_code=502, detail=upload_message)
+
+        # 更新任务元数据状态，不保存账号密码；文件保留在本机暂存目录以便排查。
+        task_metadata["status"] = "submitted"
+        (task_dir / "task.json").write_text(
+            json.dumps(task_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 不返回本机绝对路径，也不保存账号密码。
         return {
             "task_id": task_id,
-            "status": "files_received_page_ready",
-            "message": "任务信息和两个文件已接收，浏览器已进入产品订购申请页面；尚未向运营商上传或提交业务。",
+            "status": "submitted",
+            "message": upload_message,
             "files": {
                 "excel": {"filename": excel_file.filename, "size_bytes": excel_size},
                 "attachment": {"filename": attachment_file.filename, "size_bytes": attachment_size},
