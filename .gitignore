@@ -9,6 +9,7 @@ venv/
 .ruff_cache/
 
 # Runtime data
+.browser-profile/
 data/
 logs/
 screenshots/
