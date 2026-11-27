@@ -265,7 +265,7 @@ async def get_page_dom(
             result = await frame.evaluate(
                 """() => {
                     const cleanText = (value, limit = 180) =>
-                        (value || '').replace(/\\\\s+/g, ' ').trim().slice(0, limit);
+                        (value || '').replace(/\\s+/g, ' ').trim().slice(0, limit);
                     const visible = el => {
                         const style = getComputedStyle(el);
                         const rect = el.getBoundingClientRect();
