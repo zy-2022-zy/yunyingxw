@@ -96,11 +96,42 @@ def safe_original_name(raw: str | None, fallback: str) -> str:
     return (name[:120]) if name else fallback
 
 
-async def find_adcesop_frame(page):
-    """定位业务系统 iframe（ADC 承载批量导入页面）。"""
+async def find_product_order_frame(page):
+    """按产品订购页面的独有入口识别 Frame，不依赖重复的 /adcesop URL。"""
     for frame in page.frames:
-        if "/adcesop" in frame.url:
+        if "/adcesop" not in frame.url:
+            continue
+        try:
+            iframe_element = await frame.frame_element()
+            if not await iframe_element.is_visible():
+                continue
+            entry = frame.get_by_role("button", name="批量导入订购申请")
+            if await entry.count() == 1 and await entry.is_visible():
+                return frame
+        except PlaywrightError:
+            continue
+    return None
+
+
+async def find_batch_result_frame(page):
+    """按批量处理结果查询页的表头识别 Frame，避免命中同 URL 的其他业务页。"""
+    required_headers = ("待处理文件原文件名", "状态", "状态时间", "结果文件标识")
+    for frame in page.frames:
+        if "/adcesop" not in frame.url:
+            continue
+        try:
+            iframe_element = await frame.frame_element()
+            if not await iframe_element.is_visible():
+                continue
+            body_text = await frame.locator("body").inner_text(timeout=2_000)
+            if not all(header in body_text for header in required_headers):
+                continue
+            table = frame.locator(".ant-table-wrapper table:visible, table:visible")
+            if await table.count() == 0:
+                continue
             return frame
+        except PlaywrightError:
+            continue
     return None
 
 
@@ -112,7 +143,7 @@ async def submit_batch_import_popup(page, excel_path: Path, attachment_path: Pat
     - 弹窗标题“批量新增产品订购申请”，内含两个 input[type=file]（Excel 在前、附件在后）；
     - 底部为“确 认”主按钮和“取 消”按钮。
     """
-    frame = await find_adcesop_frame(page)
+    frame = await find_product_order_frame(page)
     if frame is None:
         return False, "未找到业务系统 iframe（/adcesop），无法执行批量导入。"
 
@@ -526,9 +557,9 @@ async def get_page_table(
     """接口用途：读取当前业务 Frame 中可见表格的数据；可选指定页码，为后续批量翻页读取预留能力。"""
     async with browser_manager.operation_lock:
         page_obj = await browser_manager.get_page(settings.browser_timeout_ms)
-        frame = await find_adcesop_frame(page_obj)
+        frame = await find_batch_result_frame(page_obj)
         if frame is None:
-            raise HTTPException(status_code=404, detail="未找到业务系统 iframe（/adcesop）。")
+            raise HTTPException(status_code=404, detail="未找到可见的“批量处理结果查询”页面；已检查所有 /adcesop Frame 的页面表头。")
 
         # 默认不切换页面；只有明确传入 page 参数时才执行分页跳转。
         if page is not None:
