@@ -1,4 +1,13 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_default_profile = str(
+    __import__("pathlib").Path(
+        os.environ.get("LOCALAPPDATA", __import__("pathlib").Path.home())
+    ) / "ChromeAutomationTest"
+)
 
 
 class Settings(BaseSettings):
@@ -7,6 +16,7 @@ class Settings(BaseSettings):
     app_port: int = 8000
     browser_timeout_ms: int = 20_000
     browser_cdp_url: str = "http://127.0.0.1:9222"
+    browser_user_data_dir: str = _default_profile
 
     model_config = SettingsConfigDict(
         env_file=".env",
