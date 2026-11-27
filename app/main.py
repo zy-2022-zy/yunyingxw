@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from playwright.async_api import Error as PlaywrightError
 
 from app.browser import browser_manager
@@ -15,7 +15,7 @@ async def lifespan(app: FastAPI):
     await browser_manager.close()
 
 
-app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
@@ -114,6 +114,74 @@ async def check_site(payload: SiteCheckRequest):
                 final_url=page.url,
                 detail=message[:1000],
             )
+
+
+@app.get("/api/page/dom")
+async def get_page_dom(
+    include_html: bool = Query(
+        default=False,
+        description="是否同时返回完整 HTML。完整 HTML 可能包含页面中的业务数据，默认关闭。",
+    ),
+):
+    """读取当前持久化页面的 DOM 摘要、交互控件和 iframe 信息。"""
+    async with browser_manager.operation_lock:
+        page = await browser_manager.get_page(settings.browser_timeout_ms)
+
+        async def inspect_frame(frame):
+            # 不读取输入框 value，避免把用户填写的账号、手机号等内容返回给调用方。
+            controls = await frame.locator(
+                "input, textarea, select, button, [role='button'], [role='combobox']"
+            ).evaluate_all(
+                """elements => elements.map((el, index) => ({
+                    index,
+                    tag: el.tagName.toLowerCase(),
+                    type: el.getAttribute('type'),
+                    name: el.getAttribute('name'),
+                    id: el.id || null,
+                    placeholder: el.getAttribute('placeholder'),
+                    aria_label: el.getAttribute('aria-label'),
+                    text: (el.innerText || el.getAttribute('value') || '').trim().slice(0, 120),
+                    disabled: Boolean(el.disabled),
+                    required: Boolean(el.required)
+                }))"""
+            )
+            return {
+                "frame_url": frame.url,
+                "frame_name": frame.name,
+                "controls": controls,
+                "control_count": len(controls),
+                "html": await frame.content() if include_html else None,
+            }
+
+        frames = []
+        for frame in page.frames:
+            try:
+                frames.append(await inspect_frame(frame))
+            except PlaywrightError as exc:
+                frames.append({
+                    "frame_url": frame.url,
+                    "frame_name": frame.name,
+                    "controls": [],
+                    "control_count": 0,
+                    "html": None,
+                    "error": str(exc)[:300],
+                })
+
+        main_frame = frames[0] if frames else None
+        return {
+            "url": page.url,
+            "title": await page.title(),
+            "frame_count": len(page.frames),
+            "iframe_count": max(len(page.frames) - 1, 0),
+            "frames": frames,
+            "html_included": include_html,
+            "html": main_frame["html"] if main_frame else None,
+            "message": (
+                "已读取当前页面 DOM。输入框当前值不会被读取。"
+                if not include_html
+                else "已读取当前页面 DOM 和完整 HTML；请注意 HTML 可能包含页面业务数据。"
+            ),
+        }
 
 
 if __name__ == "__main__":
