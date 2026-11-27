@@ -49,29 +49,41 @@ async def find_unique_visible_text(page, text):
 
 
 async def open_product_order_application(page, timeout_ms: int):
-    """从“我的产品”进入并打开“产品订购申请”。"""
-    my_products_frame, my_products = await find_unique_visible_text(page, "我的产品")
-    if my_products_frame is None:
-        if my_products == 0:
-            return False, "没有找到“我的产品”入口，请确认登录后的页面已加载。"
-        return False, "页面中存在多个“我的产品”匹配项，无法安全确定点击目标。"
+    """从主页面左侧菜单进入“我的产品”，再打开“产品订购申请”。"""
+    # DOM 已确认“我的产品”是主页面中的 Ant Design 菜单 li，
+    # 且具有稳定的 title 属性；不再用跨 Frame 文本搜索定位该菜单。
+    my_products = page.locator('li.ant-menu-item[title="我的产品"]')
+    await my_products.first.wait_for(state="visible", timeout=timeout_ms)
+    my_products_count = await my_products.count()
+    if my_products_count != 1:
+        return False, f"主页面中找到 {my_products_count} 个“我的产品”菜单项，无法安全确定点击目标。"
 
     await my_products.click(timeout=timeout_ms)
 
-    # 这是单页应用/嵌套 Frame 页面，不依赖整页跳转，轮询等待业务入口渲染。
+    # 点击菜单后业务内容可能异步加载到 Frame，继续跨 Frame 等待目标入口。
     deadline_ms = 25_000
     elapsed_ms = 0
     while elapsed_ms < deadline_ms:
         target_frame, target = await find_unique_visible_text(page, "产品订购申请")
         if target_frame is not None:
             await target.click(timeout=timeout_ms)
-            return True, "已点击“我的产品”并打开“产品订购申请”。"
+            return True, "已点击主页面“我的产品”，并打开“产品订购申请”。"
         if target > 1:
-            return False, "“产品订购申请”出现多个匹配入口，暂未点击，避免误选产品。"
+            return False, "“产品订购申请”出现多个匹配入口，暂未点击，避免误选。"
         await page.wait_for_timeout(500)
         elapsed_ms += 500
 
-    return False, "已点击“我的产品”，但等待 25 秒仍未找到“产品订购申请”入口。"
+    # 将实际页面状态带回接口响应，便于下一轮根据真实页面结构定位，
+    # 不输出 URL 查询参数，避免泄露会话信息。
+    frame_summary = []
+    for frame in page.frames:
+        try:
+            text = (await frame.locator("body").inner_text(timeout=2_000)).strip()
+            frame_summary.append(f"{frame.name or '主页面'}: {text[:180]}")
+        except PlaywrightError:
+            frame_summary.append(frame.name or "页面 Frame")
+    summary = "；".join(frame_summary)[:700]
+    return False, f"已点击“我的产品”，但等待 25 秒仍未找到“产品订购申请”入口。当前页面内容：{summary}"
 
 
 @app.get("/api/health")
