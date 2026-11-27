@@ -244,36 +244,125 @@ async def check_site(payload: SiteCheckRequest):
 async def get_page_dom(
     include_html: bool = Query(
         default=False,
-        description="是否同时返回完整 HTML。完整 HTML 可能包含页面中的业务数据，默认关闭。",
+        description="是否返回完整 HTML。完整 HTML 可能包含业务数据，默认关闭。",
     ),
 ):
-    """读取当前页面的 DOM 摘要、交互控件和 iframe 信息。"""
+    """读取当前页面及所有 Frame 的可见文本、交互元素和页面容器。"""
+    from urllib.parse import urlsplit, urlunsplit
+
+    def safe_frame_url(raw_url: str) -> str:
+        # Frame URL 可能在 query/hash 中携带 token、operId 等会话参数，只返回来源和路径。
+        try:
+            parsed = urlsplit(raw_url)
+            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        except Exception:
+            return raw_url.split("?", 1)[0].split("#", 1)[0]
+
     async with browser_manager.operation_lock:
         page = await browser_manager.get_page(settings.browser_timeout_ms)
 
         async def inspect_frame(frame):
-            # 不读取输入框 value，避免把用户填写的账号、手机号等内容返回给调用方。
-            controls = await frame.locator(
-                "input, textarea, select, button, [role='button'], [role='combobox']"
-            ).evaluate_all(
-                """elements => elements.map((el, index) => ({
-                    index,
-                    tag: el.tagName.toLowerCase(),
-                    type: el.getAttribute('type'),
-                    name: el.getAttribute('name'),
-                    id: el.id || null,
-                    placeholder: el.getAttribute('placeholder'),
-                    aria_label: el.getAttribute('aria-label'),
-                    text: (el.innerText || el.getAttribute('value') || '').trim().slice(0, 120),
-                    disabled: Boolean(el.disabled),
-                    required: Boolean(el.required)
-                }))"""
+            result = await frame.evaluate(
+                """() => {
+                    const cleanText = (value, limit = 180) =>
+                        (value || '').replace(/\\\\s+/g, ' ').trim().slice(0, limit);
+                    const visible = el => {
+                        const style = getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            Number(style.opacity) !== 0 &&
+                            rect.width > 0 && rect.height > 0;
+                    };
+                    const selectorFor = el => {
+                        if (el.id) return '#' + CSS.escape(el.id);
+                        const testId = el.getAttribute('data-testid');
+                        if (testId) return '[data-testid="' + CSS.escape(testId) + '"]';
+                        const parts = [];
+                        let node = el;
+                        while (node && node.nodeType === 1 && parts.length < 5) {
+                            let part = node.tagName.toLowerCase();
+                            const cls = [...node.classList].filter(Boolean).slice(0, 2);
+                            if (cls.length) part += '.' + cls.map(c => CSS.escape(c)).join('.');
+                            const parent = node.parentElement;
+                            if (parent) {
+                                const same = [...parent.children].filter(x => x.tagName === node.tagName);
+                                if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+                            }
+                            parts.unshift(part);
+                            if (node.id) break;
+                            node = parent;
+                        }
+                        return parts.join(' > ');
+                    };
+                    const describe = (el, index) => ({
+                        index,
+                        tag: el.tagName.toLowerCase(),
+                        type: el.getAttribute('type'),
+                        id: el.id || null,
+                        name: el.getAttribute('name'),
+                        class_name: cleanText(typeof el.className === 'string' ? el.className : ''),
+                        role: el.getAttribute('role'),
+                        text: cleanText(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title')),
+                        aria_label: el.getAttribute('aria-label'),
+                        title: el.getAttribute('title'),
+                        href: el.tagName === 'A' ? el.getAttribute('href') : null,
+                        placeholder: el.getAttribute('placeholder'),
+                        disabled: Boolean(el.disabled),
+                        visible: visible(el),
+                        selector: selectorFor(el)
+                    });
+
+                    const candidates = [...document.querySelectorAll(
+                        'a,button,input,textarea,select,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[onclick],[tabindex]'
+                    )].filter(visible);
+                    const unique = [...new Set(candidates)];
+                    const interactive = unique.slice(0, 400).map(describe);
+
+                    const controls = [...document.querySelectorAll(
+                        'input,textarea,select,button,[role="button"],[role="combobox"]'
+                    )].map(describe).slice(0, 300);
+
+                    const containers = [...document.querySelectorAll(
+                        'main,article,section,[class*="card"],[class*="product"],[class*="item"],[class*="panel"],[role="main"]'
+                    )].filter(visible).map((el, index) => ({
+                        index,
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || null,
+                        class_name: cleanText(typeof el.className === 'string' ? el.className : ''),
+                        text: cleanText(el.innerText, 500),
+                        selector: selectorFor(el)
+                    })).filter(item => item.text).slice(0, 150);
+
+                    const bodyText = document.body ? cleanText(document.body.innerText, 20000) : '';
+                    return {
+                        title: document.title || '',
+                        document_ready_state: document.readyState,
+                        body_text: bodyText,
+                        visible_text_length: bodyText.length,
+                        controls,
+                        control_count: controls.length,
+                        interactive_elements: interactive,
+                        interactive_count: unique.length,
+                        containers,
+                        container_count: containers.length
+                    };
+                }"""
             )
             return {
-                "frame_url": frame.url,
+                "frame_url": safe_frame_url(frame.url),
                 "frame_name": frame.name,
-                "controls": controls,
-                "control_count": len(controls),
+                "title": result["title"],
+                "document_ready_state": result["document_ready_state"],
+                "body_text": result["body_text"],
+                "visible_text_length": result["visible_text_length"],
+                "controls": result["controls"],
+                "control_count": result["control_count"],
+                "interactive_elements": result["interactive_elements"],
+                "interactive_count": result["interactive_count"],
+                "containers": result["containers"],
+                "container_count": result["container_count"],
+                # 完整 HTML 仅在显式请求时返回；常规采集不会暴露原始页面源码。
                 "html": await frame.content() if include_html else None,
             }
 
@@ -283,17 +372,22 @@ async def get_page_dom(
                 frames.append(await inspect_frame(frame))
             except PlaywrightError as exc:
                 frames.append({
-                    "frame_url": frame.url,
+                    "frame_url": safe_frame_url(frame.url),
                     "frame_name": frame.name,
                     "controls": [],
                     "control_count": 0,
+                    "interactive_elements": [],
+                    "interactive_count": 0,
+                    "containers": [],
+                    "container_count": 0,
+                    "body_text": "",
                     "html": None,
                     "error": str(exc)[:300],
                 })
 
         main_frame = frames[0] if frames else None
         return {
-            "url": page.url,
+            "url": safe_frame_url(page.url),
             "title": await page.title(),
             "frame_count": len(page.frames),
             "iframe_count": max(len(page.frames) - 1, 0),
@@ -301,8 +395,6 @@ async def get_page_dom(
             "html_included": include_html,
             "html": main_frame["html"] if main_frame else None,
             "message": (
-                "已读取当前页面 DOM。输入框当前值不会被读取。"
-                if not include_html
-                else "已读取当前页面 DOM 和完整 HTML；请注意 HTML 可能包含页面业务数据。"
+                "已读取当前页面及所有 Frame 的可见文本、控件、可交互元素和页面容器；不会读取输入框 value，Frame URL 中的查询参数和片段已脱敏。"
             ),
         }
