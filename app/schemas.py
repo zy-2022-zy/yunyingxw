@@ -1,6 +1,18 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, SecretStr
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100, description="运营商系统登录账号。")
+    password: SecretStr = Field(..., min_length=1, description="运营商系统登录密码；仅用于本次登录，不持久化。")
+
+
+class LoginResponse(BaseModel):
+    status: Literal["login_success", "verification_required", "login_failed"]
+    message: str
+    final_url: str | None = None
+    page_title: str | None = None
 
 
 class BrowserOpenRequest(BaseModel):
