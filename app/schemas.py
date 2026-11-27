@@ -9,10 +9,11 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    status: Literal["login_success", "verification_required", "login_failed"]
+    status: Literal["login_success", "verification_required", "login_failed", "navigation_failed"]
     message: str
     final_url: str | None = None
     page_title: str | None = None
+    current_step: str | None = None
 
 
 class BrowserOpenRequest(BaseModel):
