@@ -26,7 +26,52 @@ async def lifespan(app: FastAPI):
     await browser_manager.close()
 
 
+
 app = FastAPI(title=settings.app_name, version="0.8.0", lifespan=lifespan)
+
+
+async def find_unique_visible_text(page, text):
+    """跨主页面和所有 Frame 查找唯一可见的精确文本，避免误点重复入口。"""
+    matches = []
+    for frame in page.frames:
+        try:
+            locator = frame.get_by_text(text, exact=True)
+            count = await locator.count()
+            for index in range(count):
+                item = locator.nth(index)
+                if await item.is_visible():
+                    matches.append((frame, item))
+        except PlaywrightError:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    return None, len(matches)
+
+
+async def open_product_order_application(page, timeout_ms: int):
+    """从“我的产品”进入并打开“产品订购申请”。"""
+    my_products_frame, my_products = await find_unique_visible_text(page, "我的产品")
+    if my_products_frame is None:
+        if my_products == 0:
+            return False, "没有找到“我的产品”入口，请确认登录后的页面已加载。"
+        return False, "页面中存在多个“我的产品”匹配项，无法安全确定点击目标。"
+
+    await my_products.click(timeout=timeout_ms)
+
+    # 这是单页应用/嵌套 Frame 页面，不依赖整页跳转，轮询等待业务入口渲染。
+    deadline_ms = 25_000
+    elapsed_ms = 0
+    while elapsed_ms < deadline_ms:
+        target_frame, target = await find_unique_visible_text(page, "产品订购申请")
+        if target_frame is not None:
+            await target.click(timeout=timeout_ms)
+            return True, "已点击“我的产品”并打开“产品订购申请”。"
+        if target > 1:
+            return False, "“产品订购申请”出现多个匹配入口，暂未点击，避免误选产品。"
+        await page.wait_for_timeout(500)
+        elapsed_ms += 500
+
+    return False, "已点击“我的产品”，但等待 25 秒仍未找到“产品订购申请”入口。"
 
 
 @app.get("/api/health")
@@ -69,61 +114,68 @@ async def open_browser_page(payload: BrowserOpenRequest):
 
 @app.post("/api/login", response_model=LoginResponse)
 async def login(payload: LoginRequest):
-    """使用本次请求提供的账号密码登录；凭据不写入文件、配置或日志。"""
+    """登录运营商系统，并自动进入“我的产品 -> 产品订购申请”。"""
     async with browser_manager.operation_lock:
         try:
             page = await browser_manager.get_page(settings.browser_timeout_ms)
-            if "login" not in page.url.lower():
-                await page.goto(
-                    "http://10.253.61.35/cmopchannel/login",
-                    wait_until="domcontentloaded",
-                    timeout=settings.browser_timeout_ms,
-                )
 
-            account_input = page.locator("#loginNumber")
-            password_input = page.locator("#password")
-            await account_input.wait_for(state="visible")
-            await password_input.wait_for(state="visible")
-            await account_input.fill(payload.username)
-            await password_input.fill(payload.password.get_secret_value())
-            await page.locator('button[type="submit"]').click()
+            # 若当前页面已处于登录后的系统中，则复用现有会话，不重复填写账号密码。
+            if "login" in page.url.lower():
+                account_input = page.locator("#loginNumber")
+                password_input = page.locator("#password")
+                await account_input.wait_for(state="visible")
+                await password_input.wait_for(state="visible")
+                await account_input.fill(payload.username)
+                await password_input.fill(payload.password.get_secret_value())
+                await page.locator('button[type="submit"]').click()
 
-            try:
-                await page.wait_for_url(
-                    lambda url: "login" not in str(url).lower(),
-                    timeout=15_000,
-                )
-            except PlaywrightError:
-                pass
+                try:
+                    await page.wait_for_url(
+                        lambda url: "login" not in str(url).lower(),
+                        timeout=15_000,
+                    )
+                except PlaywrightError:
+                    pass
 
             final_url = page.url
             title = await page.title()
-            if "login" not in final_url.lower():
+            if "login" in final_url.lower():
+                body_text = (await page.locator("body").inner_text())[:2000]
+                if any(word in body_text for word in ("验证码", "短信", "验证", "安全校验")):
+                    return LoginResponse(
+                        status="verification_required",
+                        message="页面仍停留在登录页，可能需要完成验证码或其他人工验证。",
+                        final_url=final_url,
+                        page_title=title,
+                        current_step="登录验证",
+                    )
                 return LoginResponse(
-                    status="login_success",
-                    message="登录后页面已跳转，初步判断登录成功。",
+                    status="login_failed",
+                    message="登录后仍停留在登录页，请检查账号密码或页面提示。",
                     final_url=final_url,
                     page_title=title,
+                    current_step="登录",
                 )
 
-            body_text = (await page.locator("body").inner_text())[:2000]
-            if any(word in body_text for word in ("验证码", "短信", "验证", "安全校验")):
-                return LoginResponse(
-                    status="verification_required",
-                    message="页面仍停留在登录页，可能需要完成验证码或其他人工验证。",
-                    final_url=final_url,
-                    page_title=title,
+            # 登录成功后自动进入产品订购申请入口。
+            try:
+                opened, message = await open_product_order_application(
+                    page, settings.browser_timeout_ms
                 )
+            except PlaywrightError as exc:
+                opened, message = False, f"自动点击页面入口失败：{str(exc)[:300]}"
+
             return LoginResponse(
-                status="login_failed",
-                message="登录后仍停留在登录页，请检查账号密码或页面提示。",
-                final_url=final_url,
-                page_title=title,
+                status="login_success" if opened else "navigation_failed",
+                message=message,
+                final_url=page.url,
+                page_title=await page.title(),
+                current_step="产品订购申请" if opened else "进入产品订购申请失败",
             )
         except PlaywrightError as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"自动化登录操作失败：{str(exc)[:300]}",
+                detail=f"自动化登录或页面导航失败：{str(exc)[:300]}",
             ) from exc
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
