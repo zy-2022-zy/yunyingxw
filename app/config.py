@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     browser_headless: bool = False
     browser_channel: str = "chrome"
     browser_timeout_ms: int = 20_000
+    browser_user_data_dir: str = ".browser-profile"
 
     model_config = SettingsConfigDict(
         env_file=".env",
