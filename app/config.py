@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     browser_headless: bool = False
+    browser_channel: str = "chrome"
     browser_timeout_ms: int = 20_000
 
     model_config = SettingsConfigDict(
