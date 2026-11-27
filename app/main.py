@@ -1,15 +1,21 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import Error as PlaywrightError
 
 from app.browser import browser_manager
 from app.config import settings
-from app.schemas import SiteCheckRequest, SiteCheckResponse
+from app.schemas import (
+    BrowserOpenRequest,
+    BrowserOpenResponse,
+    SiteCheckRequest,
+    SiteCheckResponse,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 服务启动时只初始化 Playwright，不主动启动或弹出 Chrome。
     await browser_manager.start(
         cdp_url=settings.browser_cdp_url,
         user_data_dir=settings.browser_user_data_dir,
@@ -18,12 +24,45 @@ async def lifespan(app: FastAPI):
     await browser_manager.close()
 
 
-app = FastAPI(title=settings.app_name, version="0.7.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="0.8.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
 async def health():
     return {"ok": True, "service": settings.app_name}
+
+
+@app.get("/api/browser/status")
+async def get_browser_status():
+    """查看浏览器状态；此接口不会为了检查状态而启动 Chrome。"""
+    return browser_manager.status()
+
+
+@app.post("/api/browser/open", response_model=BrowserOpenResponse)
+async def open_browser_page(payload: BrowserOpenRequest):
+    """按需启动或恢复专用 Chrome，并打开指定网页。"""
+    async with browser_manager.operation_lock:
+        try:
+            page = await browser_manager.get_page(settings.browser_timeout_ms)
+            response = await page.goto(
+                str(payload.url),
+                wait_until="domcontentloaded",
+                timeout=settings.browser_timeout_ms,
+            )
+            return BrowserOpenResponse(
+                status="opened",
+                message="网页已在专用 Chrome 中打开。",
+                final_url=page.url,
+                page_title=await page.title(),
+                http_status=response.status if response else None,
+            )
+        except PlaywrightError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"浏览器已启动或正在恢复，但打开网页失败：{str(exc)[:500]}",
+            ) from exc
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/site/check", response_model=SiteCheckResponse)
@@ -144,7 +183,7 @@ async def get_page_dom(
         description="是否同时返回完整 HTML。完整 HTML 可能包含页面中的业务数据，默认关闭。",
     ),
 ):
-    """读取当前持久化页面的 DOM 摘要、交互控件和 iframe 信息。"""
+    """读取当前页面的 DOM 摘要、交互控件和 iframe 信息。"""
     async with browser_manager.operation_lock:
         page = await browser_manager.get_page(settings.browser_timeout_ms)
 
