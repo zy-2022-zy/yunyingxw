@@ -1,12 +1,11 @@
 import os
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _default_profile = str(
-    __import__("pathlib").Path(
-        os.environ.get("LOCALAPPDATA", __import__("pathlib").Path.home())
-    ) / "ChromeAutomationTest"
+    Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ChromeAutomationTest"
 )
 
 
