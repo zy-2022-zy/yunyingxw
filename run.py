@@ -3,6 +3,8 @@ import sys
 
 import uvicorn
 
+from app.config import settings
+
 
 if __name__ == "__main__":
     # Playwright needs subprocess support; use ProactorEventLoop on Windows.
@@ -13,7 +15,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host="127.0.0.1",
-        port=8000,
+        host=settings.app_host,
+        port=settings.app_port,
         reload=False,
     )
